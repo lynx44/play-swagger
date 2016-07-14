@@ -3,6 +3,7 @@ package com.iheart.playSwagger
 import java.io.File
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.iheart.playSwagger.Domain.{Definition, SwaggerParameter}
+import play.api.libs.functional.syntax._
 import play.api.libs.json._
 import ResourceReader.read
 import org.yaml.snakeyaml.Yaml
@@ -13,14 +14,15 @@ import play.routes.compiler._
 import scala.util.{Try, Success, Failure}
 
 object SwaggerSpecGenerator {
-  private val marker = "##"
+  val marker = "##"
   def apply(domainNameSpaces: String*)(implicit cl: ClassLoader): SwaggerSpecGenerator = SwaggerSpecGenerator(PrefixDomainModelQualifier(domainNameSpaces: _*))
 }
 
 final case class SwaggerSpecGenerator(
-  modelQualifier:        DomainModelQualifier = PrefixDomainModelQualifier(),
-  defaultPostBodyFormat: String               = "application/json"
-)(implicit cl: ClassLoader) {
+  modelQualifier:        DomainModelQualifier                                                                     = PrefixDomainModelQualifier(),
+  defaultPostBodyFormat: String                                                                                   = "application/json",
+  endpointSpecBuilder:   (DomainModelQualifier, String, Route, Option[String], ClassLoader) ⇒ EndPointSpecBuilder = (modelQualifier, defaultPostBodyFormat, route, tag, cl) ⇒ new EndPointSpecBuilder(modelQualifier, defaultPostBodyFormat, route, tag, cl)
+)(implicit cl: ClassLoader) extends YamlParser with SwaggerJsonSerializers {
 
   // routes with their prefix
   type Routes = (String, Seq[Route])
@@ -31,7 +33,8 @@ final case class SwaggerSpecGenerator(
 
   val defaultRoutesFile = "routes"
 
-  def generate(routesFile: String = defaultRoutesFile): Try[JsObject] = generateFromRoutesFile(routesFile = routesFile, base = defaultBase)
+  def generate(): Try[JsObject] = generate(defaultRoutesFile)
+  def generate(routesFile: String): Try[JsObject] = generateFromRoutesFile(routesFile = routesFile, base = defaultBase)
 
   val routesExt = ".routes"
 
@@ -67,7 +70,7 @@ final case class SwaggerSpecGenerator(
         }, { rules ⇒
           val routerName = tagFromFile(routesFile)
           val init: RoutesData = Success(ListMap(routerName → (path, Seq.empty)))
-          rules.foldLeft(init) {
+          val routeData = rules.foldLeft(init) {
             case (Success(acc), route: Route) ⇒
               val (prefix, routes) = acc(routerName)
               Success(acc + (routerName → (prefix, routes :+ route)))
@@ -81,6 +84,7 @@ final case class SwaggerSpecGenerator(
 
             case (l @ Failure(_), _) ⇒ l
           }
+          routeData
         })
       }
     }
@@ -93,10 +97,18 @@ final case class SwaggerSpecGenerator(
    * Generate directly from routes
    *
    * @param routes [[Route]]s compiled by Play routes compiler
+   * @return
+   */
+  def generateFromRoutes(routes: ListMap[Tag, (String, Seq[Route])]): JsObject = generateFromRoutes(routes, defaultBase)
+
+  /**
+   * Generate directly from routes
+   *
+   * @param routes [[Route]]s compiled by Play routes compiler
    * @param base
    * @return
    */
-  def generateFromRoutes(routes: ListMap[Tag, (String, Seq[Route])], base: JsObject = defaultBase): JsObject = {
+  def generateFromRoutes(routes: ListMap[Tag, (String, Seq[Route])], base: JsObject): JsObject = {
     val docs = routes.map {
       case (tag, (prefix, routes)) ⇒
         //val subTag = if (tag == tagFromFile(routesFile)) None else Some(tag)
@@ -109,6 +121,7 @@ final case class SwaggerSpecGenerator(
     paths:    ListMap[String, JsObject],
     baseJson: JsObject                  = Json.obj()
   ): JsObject = {
+
     val pathsJson = paths.values.reduce(_ ++ _)
     val allRefs = (pathsJson ++ baseJson) \\ "$ref"
 
@@ -125,14 +138,9 @@ final case class SwaggerSpecGenerator(
 
     val definitionsJson = JsObject(definitions.map(d ⇒ d.name → Json.toJson(d)))
 
-    //TODO: remove hardcoded path
-    val generatedTagsJson = JsArray(
-      paths.keys
-      //.filterNot(_ == RoutesFileReader.rootRoute)
-      .map(tag ⇒ Json.obj("name" → tag)).toSeq
-    )
+    val jsonTagGenerator = new JsonTagGenerator(paths)
 
-    val tagsJson = mergeByName(generatedTagsJson, (baseJson \ "tags").asOpt[JsArray].getOrElse(JsArray()))
+    val tagsJson = JsonHelper.mergeByName(jsonTagGenerator.generatedTagsJson, (baseJson \ "tags").asOpt[JsArray].getOrElse(JsArray()))
 
     Json.obj(
       "paths" → pathsJson,
@@ -142,33 +150,7 @@ final case class SwaggerSpecGenerator(
       )
   }
 
-  private val referencePrefix = "#/definitions/"
-
-  private val refWrite = OWrites((refType: String) ⇒ Json.obj("$ref" → JsString(referencePrefix + refType)))
-
   import play.api.libs.functional.syntax._
-
-  private lazy val paramFormat: Writes[SwaggerParameter] = (
-    (__ \ 'name).write[String] ~
-    (__ \ 'type).writeNullable[String] ~
-    (__ \ 'format).writeNullable[String] ~
-    (__ \ 'required).write[Boolean] ~
-    (__ \ 'default).writeNullable[JsValue] ~
-    (__ \ 'example).writeNullable[JsValue] ~
-    (__ \ "schema").writeNullable[String](refWrite) ~
-    (__ \ "items").writeNullable[SwaggerParameter](defPropFormat) ~
-    (__ \ "enum").writeNullable[Seq[String]]
-  )(unlift(SwaggerParameter.unapply))
-
-  private lazy val defPropFormat: Writes[SwaggerParameter] = (
-    (__ \ 'type).writeNullable[String] ~
-    (__ \ 'format).writeNullable[String] ~
-    (__ \ 'default).writeNullable[JsValue] ~
-    (__ \ 'example).writeNullable[JsValue] ~
-    (__ \ "$ref").writeNullable[String] ~
-    (__ \ "items").lazyWriteNullable[SwaggerParameter](defPropFormat) ~
-    (__ \ "enum").writeNullable[Seq[String]]
-  )(p ⇒ (p.`type`, p.format, p.default, p.example, p.referenceType.map(referencePrefix + _), p.items, p.enum))
 
   implicit class PathAdditions(path: JsPath) {
     def writeNullableIterable[A <: Iterable[_]](implicit writes: Writes[A]): OWrites[A] =
@@ -195,21 +177,6 @@ final case class SwaggerSpecGenerator(
 
   private def defaultBase = readBaseCfg("swagger.json") orElse readBaseCfg("swagger.yml") getOrElse Json.obj()
 
-  private def mergeByName(base: JsArray, toMerge: JsArray): JsArray = {
-    JsArray(base.value.map { bs ⇒
-      val name = (bs \ "name").as[String]
-      findByName(toMerge, name).fold(bs) { f ⇒ bs.as[JsObject] deepMerge f }
-    } ++ toMerge.value.filter { tm ⇒
-      (tm \ "name").validate[String].fold({ errors ⇒ true }, { name ⇒
-        findByName(base, name).isEmpty
-      })
-    })
-  }
-
-  private def findByName(array: JsArray, name: String): Option[JsObject] =
-    array.value.find(param ⇒ (param \ "name").asOpt[String].contains(name))
-      .map(_.as[JsObject])
-
   private def readBaseCfg(name: String): Option[JsObject] = {
     Option(cl.getResource(name)).map { url ⇒
       val st = url.openStream()
@@ -225,14 +192,6 @@ final case class SwaggerSpecGenerator(
         st.close()
       }
     }
-  }
-
-  private def parseYaml(yamlStr: String): JsObject = {
-    val yaml = new Yaml()
-    val map = yaml.load(yamlStr).asInstanceOf[java.util.Map[String, Object]]
-    val mapper = new ObjectMapper()
-    val jsonString = mapper.writeValueAsString(map)
-    Json.parse(jsonString).as[JsObject]
   }
 
   private def paths(routes: Seq[Route], prefix: String, tag: Option[Tag]): JsObject = {
@@ -255,7 +214,7 @@ final case class SwaggerSpecGenerator(
         case StaticPart(value)       ⇒ value
       }.mkString
       val method = route.verb.value.toLowerCase
-      Some(fullPath(prefix, inRoutePath) → Json.obj(method → endPointSpec(route, tag)))
+      Some(fullPath(prefix, inRoutePath) → Json.obj(method → endpointSpecBuilder(modelQualifier, defaultPostBodyFormat, route, tag, cl).generateSpec()))
     }
   }
 
@@ -266,43 +225,115 @@ final case class SwaggerSpecGenerator(
         inRoutePath.stripPrefix("/")
       ).filterNot(_.isEmpty).
         mkString("/")
+}
 
-  // Multiple routes may have the same path, merge the objects instead of overwriting
+trait YamlParser {
+  def parseYaml(yamlStr: String): JsObject = {
+    val yaml = new Yaml()
+    val map = yaml.load(yamlStr).asInstanceOf[java.util.Map[String, Object]]
+    val mapper = new ObjectMapper()
+    val jsonString = mapper.writeValueAsString(map)
+    Json.parse(jsonString).as[JsObject]
+  }
+}
 
-  private def endPointSpec(route: Route, tag: Option[String]) = {
+trait SwaggerJsonSerializers {
+  val referencePrefix = "#/definitions/"
 
-    def tryParseYaml(comment: String): Option[JsObject] = {
-      val pattern = "^\\w+:".r
-      pattern.findFirstIn(comment).map(_ ⇒ parseYaml(comment))
+  val refWrite = OWrites((refType: String) ⇒ Json.obj("$ref" → JsString(referencePrefix + refType)))
+  lazy val paramFormat: Writes[SwaggerParameter] = (
+    (__ \ 'name).write[String] ~
+    (__ \ 'type).writeNullable[String] ~
+    (__ \ 'format).writeNullable[String] ~
+    (__ \ 'required).write[Boolean] ~
+    (__ \ 'default).writeNullable[JsValue] ~
+    (__ \ 'example).writeNullable[JsValue] ~
+    (__ \ "schema").writeNullable[String](refWrite) ~
+    (__ \ "items").writeNullable[SwaggerParameter](defPropFormat) ~
+    (__ \ "enum").writeNullable[Seq[String]]
+  )(unlift(SwaggerParameter.unapply))
+
+  lazy val defPropFormat: Writes[SwaggerParameter] = (
+    (__ \ 'type).writeNullable[String] ~
+    (__ \ 'format).writeNullable[String] ~
+    (__ \ 'default).writeNullable[JsValue] ~
+    (__ \ 'example).writeNullable[JsValue] ~
+    (__ \ "$ref").writeNullable[String] ~
+    (__ \ "items").lazyWriteNullable[SwaggerParameter](defPropFormat) ~
+    (__ \ "enum").writeNullable[Seq[String]]
+  )(p ⇒ (p.`type`, p.format, p.default, p.example, p.referenceType.map(referencePrefix + _), p.items, p.enum))
+}
+
+class JsonTagGenerator(paths: ListMap[String, JsObject]) {
+  //TODO: remove hardcoded path
+  val generatedTagsJson = JsArray(
+    paths.keys
+    //.filterNot(_ == RoutesFileReader.rootRoute)
+    .map(tag ⇒ Json.obj("name" → tag)).toSeq
+  )
+}
+
+object JsonHelper {
+
+  def findByName(array: JsArray, name: String): Option[JsObject] =
+    array.value.find(param ⇒ (param \ "name").asOpt[String].contains(name))
+      .map(_.as[JsObject])
+
+  def mergeByName(base: JsArray, toMerge: JsArray): JsArray = {
+    JsArray(base.value.map { bs ⇒
+      val name = (bs \ "name").as[String]
+      findByName(toMerge, name).fold(bs) { f ⇒ bs.as[JsObject] deepMerge f }
+    } ++ toMerge.value.filter { tm ⇒
+      (tm \ "name").validate[String].fold({ errors ⇒ true }, { name ⇒
+        findByName(base, name).isEmpty
+      })
+    })
+  }
+}
+
+class EndPointSpecBuilder(modelQualifier: DomainModelQualifier, defaultPostBodyFormat: String, route: Route, tag: Option[String], cl: ClassLoader) extends YamlParser with SwaggerJsonSerializers {
+  private implicit def classLoader = cl
+  private def tryParseYaml(comment: String): Option[JsObject] = {
+    val pattern = "^\\w+:".r
+    pattern.findFirstIn(comment).map(_ ⇒ parseYaml(comment))
+  }
+
+  private def tryParseJson(comment: String): Option[JsObject] = {
+    if (comment.startsWith("{"))
+      Some(Json.parse(comment).as[JsObject])
+    else None
+  }
+
+  private def amendBodyParam(params: JsArray): JsArray = {
+    val bodyParam = JsonHelper.findByName(params, "body")
+    amendBodyParam(bodyParam).fold(params) { param ⇒
+      JsArray(param +: params.value.filterNot(_ == bodyParam.get))
     }
+  }
 
-    def tryParseJson(comment: String): Option[JsObject] = {
-      if (comment.startsWith("{"))
-        Some(Json.parse(comment).as[JsObject])
-      else None
-    }
+  protected def amendBodyParam(param: Option[JsObject]) = {
+    param.map(_ + ("in" → JsString("body")))
+  }
+
+  protected def readControllerParams = {
+    val pathParams = route.path.parts.collect {
+      case d: DynamicPart ⇒ d.name
+    }.toSet
+
+    val params = route.call.parameters
+      .fold(Seq.empty[SwaggerParameter])(_.map(mapParam(_, modelQualifier)))
+
+    JsArray(params.map { p ⇒
+      val jo = Json.toJson(p)(paramFormat).as[JsObject]
+      val in = if (pathParams.contains(p.name)) "path" else "query"
+      jo + ("in" → JsString(in))
+    })
+  }
+
+  def generateSpec(): JsObject = {
 
     val paramsFromController = {
-      val pathParams = route.path.parts.collect {
-        case d: DynamicPart ⇒ d.name
-      }.toSet
-
-      val params = route.call.parameters
-        .fold(Seq.empty[SwaggerParameter])(_.map(mapParam(_, modelQualifier)))
-
-      JsArray(params.map { p ⇒
-        val jo = Json.toJson(p)(paramFormat).as[JsObject]
-        val in = if (pathParams.contains(p.name)) "path" else "query"
-        jo + ("in" → JsString(in))
-      })
-    }
-
-    def amendBodyParam(params: JsArray): JsArray = {
-      val bodyParam = findByName(params, "body")
-      bodyParam.fold(params) { param ⇒
-        val enhancedBodyParam = param + ("in" → JsString("body"))
-        JsArray(enhancedBodyParam +: params.value.filterNot(_ == bodyParam.get))
-      }
+      readControllerParams
     }
 
     val jsonFromComment = {
@@ -323,7 +354,7 @@ final case class SwaggerSpecGenerator(
 
     val paramsFromComment = jsonFromComment.flatMap(jc ⇒ (jc \ "parameters").asOpt[JsArray]).map(amendBodyParam)
 
-    val mergedParams = mergeByName(paramsFromController, paramsFromComment.getOrElse(JsArray()))
+    val mergedParams = JsonHelper.mergeByName(paramsFromController, paramsFromComment.getOrElse(JsArray()))
 
     val parameterJson = if (mergedParams.value.nonEmpty) Json.obj("parameters" → mergedParams) else Json.obj()
 
@@ -333,9 +364,8 @@ final case class SwaggerSpecGenerator(
 
     val hasConsumes = (rawPathJson \ "consumes").toOption.isDefined
 
-    if (findByName(mergedParams, "body").isDefined && !hasConsumes)
+    if (JsonHelper.findByName(mergedParams, "body").isDefined && !hasConsumes)
       rawPathJson + ("consumes" → Json.arr(defaultPostBodyFormat))
     else rawPathJson
   }
 }
-

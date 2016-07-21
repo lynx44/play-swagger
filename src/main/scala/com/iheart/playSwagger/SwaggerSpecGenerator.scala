@@ -311,8 +311,16 @@ class EndPointSpecBuilder(modelQualifier: DomainModelQualifier, defaultPostBodyF
     }
   }
 
-  protected def amendBodyParam(param: Option[JsObject]) = {
+  private def amendBodyParam(param: Option[JsObject]) = {
     param.map(_ + ("in" → JsString("body")))
+  }
+
+  protected def transformUserDoc(userDefinedDoc: Option[JsObject]): Option[JsObject] = {
+    userDefinedDoc
+  }
+
+  protected def transformFinalDoc(finalDoc: JsObject): JsObject = {
+    finalDoc
   }
 
   protected def readControllerParams = {
@@ -339,17 +347,19 @@ class EndPointSpecBuilder(modelQualifier: DomainModelQualifier, defaultPostBodyF
     val jsonFromComment = {
       import SwaggerSpecGenerator.marker
 
-      val comments = route.comments.map(_.comment)
-      val commentDocLines = comments match {
-        case `marker` +: docs :+ `marker` ⇒ docs
-        case _                            ⇒ Nil
-      }
+      transformUserDoc({
+        val comments = route.comments.map(_.comment)
+        val commentDocLines = comments match {
+          case `marker` +: docs :+ `marker` ⇒ docs
+          case _                            ⇒ Nil
+        }
 
-      for {
-        leadingSpace ← commentDocLines.headOption.flatMap("""^(\s*)""".r.findFirstIn)
-        comment = commentDocLines.map(_.drop(leadingSpace.length)).mkString("\n")
-        result ← tryParseJson(comment) orElse tryParseYaml(comment)
-      } yield result
+        for {
+          leadingSpace ← commentDocLines.headOption.flatMap("""^(\s*)""".r.findFirstIn)
+          comment = commentDocLines.map(_.drop(leadingSpace.length)).mkString("\n")
+          result ← tryParseJson(comment) orElse tryParseYaml(comment)
+        } yield result
+      })
     }
 
     val paramsFromComment = jsonFromComment.flatMap(jc ⇒ (jc \ "parameters").asOpt[JsArray]).map(amendBodyParam)
@@ -364,8 +374,10 @@ class EndPointSpecBuilder(modelQualifier: DomainModelQualifier, defaultPostBodyF
 
     val hasConsumes = (rawPathJson \ "consumes").toOption.isDefined
 
-    if (JsonHelper.findByName(mergedParams, "body").isDefined && !hasConsumes)
-      rawPathJson + ("consumes" → Json.arr(defaultPostBodyFormat))
-    else rawPathJson
+    transformFinalDoc(
+      if (JsonHelper.findByName(mergedParams, "body").isDefined && !hasConsumes)
+        rawPathJson + ("consumes" → Json.arr(defaultPostBodyFormat))
+      else rawPathJson
+    )
   }
 }

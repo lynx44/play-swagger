@@ -33,8 +33,7 @@ final case class SwaggerSpecGenerator(
 
   val defaultRoutesFile = "routes"
 
-  def generate(): Try[JsObject] = generate(defaultRoutesFile)
-  def generate(routesFile: String): Try[JsObject] = generateFromRoutesFile(routesFile = routesFile, base = defaultBase)
+  def generate(routesFile: String = defaultRoutesFile): Try[JsObject] = generateFromRoutesFile(routesFile = routesFile, base = defaultBase)
 
   val routesExt = ".routes"
 
@@ -97,18 +96,10 @@ final case class SwaggerSpecGenerator(
    * Generate directly from routes
    *
    * @param routes [[Route]]s compiled by Play routes compiler
-   * @return
-   */
-  def generateFromRoutes(routes: ListMap[Tag, (String, Seq[Route])]): JsObject = generateFromRoutes(routes, defaultBase)
-
-  /**
-   * Generate directly from routes
-   *
-   * @param routes [[Route]]s compiled by Play routes compiler
    * @param base
    * @return
    */
-  def generateFromRoutes(routes: ListMap[Tag, (String, Seq[Route])], base: JsObject): JsObject = {
+  def generateFromRoutes(routes: ListMap[Tag, (String, Seq[Route])], base: JsObject = defaultBase): JsObject = {
     val docs = routes.map {
       case (tag, (prefix, routes)) ⇒
         //val subTag = if (tag == tagFromFile(routesFile)) None else Some(tag)
